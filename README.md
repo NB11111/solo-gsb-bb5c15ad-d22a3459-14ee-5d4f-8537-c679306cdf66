@@ -453,6 +453,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   更大**的极值，平局时稳定取（时间戳、事件 ID）先出现者；常数桶的最小最大为同一样本，只计一次。
 - 返回点按**（时间戳、事件 ID）原序**输出，前端仍按阶梯曲线连接。
 
+读取路径不再把通道范围内样本一次性 `fetchall` 进内存：在**同一个 SQLite 只读快照**内，先
+`COUNT(*)` 统计范围内样本数，再按 `(ts, id)` 顺序以固定大小批次（`fetchmany`，每批 1000 行）
+逐批扫描——未超预算时原样累计返回；超预算时先取范围首尾端点，中间行直接写入与桶一一对应的
+**定长桶累加器**（只留桶首、桶尾、最小、最大四个候选），扫完再按上述规则完成分桶极值选择。
+因此单通道抽样的额外工作内存只随 `max_points`（加一个扫描批次）有界，不随原始行数增长；
+统计与扫描共用同一已提交版本，并发提交夹在扫描批次之间也不会改变桶划分或计数。流式分桶与
+`downsample` 全量计算的输出逐点一致（含平局、单槽位与原序），由 fuzz 等价、5 万行大样本与
+并发提交测试覆盖。
+
 ## 故障事件归并语义
 
 「故障事件」是**只读派生视图**，不改写、不删除 `fault_intervals` 中的任何原始故障结果：
@@ -802,9 +811,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 写事务**提交前**，读接口看到的是上一次已提交的旧值；**提交后**新值才对后续查询可见；
 - 写事务**回滚**的事件、故障、规则等内容对读接口**自始至终不可见**（不会出现「先读到、后消失」）；
 - 多条 SELECT 需要描述同一瞬间时（如 `/api/events` 的 `total` 计数与分页列表、时间轴对全部
-  通道/故障/维护/标注的聚合、导出整包、规则重算的全部输入）在服务端统一包进一个
-  **只读快照事务（read snapshot）**：快照内所有 SELECT 取自同一个已提交版本，并发提交夹在
-  两条 SELECT 之间也不会造成计数与记录不一致；快照结束后的下一次查询再看到新提交。
+  通道/故障/维护/标注的聚合——含每通道的范围内计数与其随后的分批扫描、导出整包、规则重算的全部
+  输入）在服务端统一包进一个**只读快照事务（read snapshot）**：快照内所有 SELECT（含分批扫描的
+  每个 `fetchmany`）取自同一个已提交版本，并发提交夹在两条 SELECT 或两个扫描批次之间也不会造成
+  计数与记录不一致；快照结束后的下一次查询再看到新提交。
 
 导入、撤销、规则重算等写路径的事务边界与 API 返回结构保持不变；只读连接开启
 `PRAGMA query_only` 且处于自动提交模式，单条 SELECT 自成快照、读完即释放读锁，不阻塞写。
@@ -839,7 +849,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET/POST /api/maintenance`，`GET/PUT/DELETE /api/maintenance/{id}` | 计划维护窗口增删改查（按设备、半开区间；写入后自动重新评估全部规则并返回评估摘要） |
 | `GET /api/suppressed?start&end` | 被维护抑制的片段（关联规则与来源维护窗口，半开相交筛选）；片段按维护窗口边界拆分，每段仅携带实际覆盖它的窗口 ID（重叠共同归因、相接在交界处切换） |
 | `GET/POST /api/annotations`，`DELETE /api/annotations/{id}` | 区间标注 |
-| `GET /api/timeline?start&end&max_points` | 时间轴聚合数据（通道有界极值抽样：首尾必留、中间分桶取各桶最小/最大、单槽位取偏离桶首尾基线更大者，点数不超 `max_points`；`count`/`shown` 与故障、维护窗口、被抑制片段、标注仍用原数据） |
+| `GET /api/timeline?start&end&max_points` | 时间轴聚合数据（通道有界极值抽样：同一只读快照内先计数再分批扫描，定长桶累加器完成分桶取最小/最大、单槽位取偏离桶首尾基线更大者，首尾必留、原序输出，点数不超 `max_points`，单通道工作内存不随原始行数增长；`count`/`shown` 与故障、维护窗口、被抑制片段、标注仍用同一提交视图的原数据） |
 | `GET /api/export?start&end&download=true` | 导出完整 JSON（附件下载，含维护窗口与被抑制片段） |
 | `POST /api/demo` | 载入内置示例数据与规则（同样记录批次快照，可在「导入批次」中撤销） |
 | `POST /api/reset` | 清空全部数据（事件、规则、故障、维护、标注，以及导入批次与导入前快照） |
@@ -868,7 +878,7 @@ app/
   engine.py           # 半开区间、扫描线 AND/OR 合并、持续时长过滤、证据、条件复位阈值（迟滞锁存）、通道采样有效期(TTL)截断、维护扣除/抑制、区间聚类（事件归并）、草稿影响对比（diff_faults）、规则组合故障日账切分（daily_fault_ledger / utc_midnight）
 
   db.py               # SQLite 连接、建表（imports/import_snapshots 导入批次与导入前快照、channel_ttls 与 rule_conditions.reset_threshold，含老库自动加列迁移）、基础查询、upsert/快照写入
-  services.py         # JSONL 导入（导入前快照、导入后自动重算）、导入批次列表与批次撤销（undo_import，事务删除/恢复+刷新故障）、规则评估、草稿预览（preview_rule）、采样有效期设置/清除、时间轴有界极值抽样（downsample：首尾必留、中间分桶取各桶最小/最大、单槽位取偏离桶首尾基线更大者、按原序输出且不超 max_points）、筛选、故障事件归并、被抑制片段、规则组合故障日账（query_fault_daily_ledger）、采样节拍稽核（query_sampling_audit，只读 events）、冗余通道一致性核查（query_channel_consistency，只读 events/channel_ttls）、规则故障先后配对（query_fault_pairing，只读 fault_intervals）、单通道突变恢复诊断（query_mutation_recovery，只读 events/channel_ttls）、导出
+  services.py         # JSONL 导入（导入前快照、导入后自动重算）、导入批次列表与批次撤销（undo_import，事务删除/恢复+刷新故障）、规则评估、草稿预览（preview_rule）、采样有效期设置/清除、时间轴有界极值抽样（downsample：首尾必留、中间分桶取各桶最小/最大、单槽位取偏离桶首尾基线更大者、按原序输出且不超 max_points；时间轴读取走 _downsample_channel_samples：同一只读快照内先 COUNT 范围内样本、再以 fetchmany 定批扫描进定长桶累加器，单通道额外工作内存随 max_points 有界而非原始行数）、筛选、故障事件归并、被抑制片段、规则组合故障日账（query_fault_daily_ledger）、采样节拍稽核（query_sampling_audit，只读 events）、冗余通道一致性核查（query_channel_consistency，只读 events/channel_ttls）、规则故障先后配对（query_fault_pairing，只读 fault_intervals）、单通道突变恢复诊断（query_mutation_recovery，只读 events/channel_ttls）、导出
   main.py             # FastAPI 路由与静态页面（含 /api/imports 列表与 /api/imports/{id}/undo 撤销、/api/channel-ttls、只读 /api/fault-daily-ledger、只读 /api/sampling-audit、只读 /api/consistency-check、只读 /api/fault-pairing 与只读 /api/mutation-recovery；条件复位阈值校验）
   static/             # 原生 JS 前端（index.html / app.js / styles.css，侧栏含「导入批次 / 撤销」卡片与撤销入口、规则弹层内含「预览影响」与每条件「复位阈值」、侧栏含「采样有效期」卡片与泳道 TTL 徽标、故障卡片下含「规则组合故障日账」勾选与逐日表格、「采样节拍稽核」通道选择/参数表单/汇总与缺采段表格、「冗余通道一致性核查」双通道选择/阈值表单/汇总与不一致片段表格、「规则故障先后配对」双规则选择/最大滞后表单/配对与未配对表格、「单通道突变恢复诊断」通道选择/阈值/容差/观察时长表单与逐段起止样本/最大偏差/恢复耗时/未恢复原因表格）
 samples/
@@ -940,4 +950,7 @@ UTC 午夜切分、跨日片段只在起始日计新起 / 后续日计延续、�
 的未超预算原样返回、返回点数不超过 `max_points`、范围内首尾样本必留、中间分桶各桶最小值与最大值
 同取（孤立尖峰 / 低谷不再丢失）、单槽位桶取偏离自身首尾连线基线更大的极值（倾斜基线按线性插值，
 平局取先出现者）、奇数预算单槽落末桶、常数桶只计一次、极小预算边界，以及 `/api/timeline` 的
-`count`/`shown` 与故障、维护等图层不受抽样影响、通道点按（时间戳、事件 ID）原序输出。
+`count`/`shown` 与故障、维护等图层不受抽样影响、通道点按（时间戳、事件 ID）原序输出；时间轴
+流式读取还覆盖：分批扫描每批不超 1000 行、与 `downsample(fetchall(...))` 逐点等价的 fuzz
+对照（多种窗口/预算/平局序列）、5 万行大样本计数精确且首尾与孤立尖峰/低谷保留、未提交行不可见、
+扫描批次之间提交落入快照后计数/桶划分/首尾保持同一视图而下次请求再看到新提交。

@@ -293,6 +293,27 @@ def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
     return _read_target().execute(sql, tuple(params)).fetchone()
 
 
+def query_batches(sql: str, params: Iterable[Any] = (), batch_size: int = 1000):
+    """Yield the query result as bounded-size batches instead of fetchall.
+
+    Like :func:`query` this reads through the committed-view read layer (so
+    an enclosing :func:`read_snapshot` pins every batch to the same read
+    transaction), but only ``batch_size`` rows are materialized at a time:
+    large scans keep their extra Python memory bounded by the batch size
+    instead of growing with the full result.  The cursor is closed as soon
+    as the generator is exhausted or closed by the caller.
+    """
+    cur = _read_target().execute(sql, tuple(params))
+    try:
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            yield rows
+    finally:
+        cur.close()
+
+
 def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
     conn = get_conn()
     with _write_lock:

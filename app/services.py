@@ -1251,6 +1251,35 @@ def query_annotations(start: float | None = None, end: float | None = None) -> l
     ]
 
 
+def _single_slot_choice(span, low, high) -> tuple[float, float, int]:
+    """Pick one extreme for a bucket that has only a single point slot.
+
+    Between the bucket's minimum and maximum candidates, the one deviating
+    more from the bucket's own first→last baseline (the straight line
+    between the bucket's first and last samples — ``span`` is anything
+    indexable as [0]/[-1]) is kept; equal deviations resolve stably to the
+    sample appearing first in (ts, event id) order.
+    """
+    # Samples are unique by event id, so equal ids mean the constant /
+    # single-sample case whether or not low and high are the same object.
+    if low[2] == high[2]:
+        return low
+    (t0, v0, _), (t1, v1, _) = span[0], span[-1]
+
+    def deviation(p: tuple[float, float, int]) -> float:
+        if t1 == t0:
+            return abs(p[1] - v0)
+        baseline = v0 + (v1 - v0) * (p[0] - t0) / (t1 - t0)
+        return abs(p[1] - baseline)
+
+    dev_low, dev_high = deviation(low), deviation(high)
+    if dev_low > dev_high:
+        return low
+    if dev_high > dev_low:
+        return high
+    return min((low, high), key=lambda p: (p[0], p[2]))
+
+
 def _bucket_extremes(
     bucket: list[tuple[float, float, int]],
 ) -> list[tuple[float, float, int]]:
@@ -1272,29 +1301,187 @@ def _largest_deviation_extreme(
 ) -> tuple[float, float, int]:
     """The single bucket extreme to keep when the budget allows only one.
 
-    Between the bucket's minimum and maximum candidates, the one deviating
-    more from the bucket's own first→last baseline (the straight line
-    between the bucket's first and last samples) is kept; equal deviations
-    resolve stably to the sample appearing first in (ts, event id) order.
+    See :func:`_single_slot_choice`; this is the in-memory wrapper used by
+    :func:`downsample`.
     """
     low = min(bucket, key=lambda p: p[1])
     high = max(bucket, key=lambda p: p[1])
-    if low is high:
-        return low
-    (t0, v0, _), (t1, v1, _) = bucket[0], bucket[-1]
+    return _single_slot_choice(bucket, low, high)
 
-    def deviation(p: tuple[float, float, int]) -> float:
-        if t1 == t0:
-            return abs(p[1] - v0)
-        baseline = v0 + (v1 - v0) * (p[0] - t0) / (t1 - t0)
-        return abs(p[1] - baseline)
 
-    dev_low, dev_high = deviation(low), deviation(high)
-    if dev_low > dev_high:
-        return low
-    if dev_high > dev_low:
-        return high
-    return min((low, high), key=lambda p: (p[0], p[2]))
+class _BucketAccumulator:
+    """Streaming state for one downsample bucket (constant extra memory).
+
+    Tracks the bucket's first and last sample (its first→last baseline) and
+    the first-occurrence-wins minimum/maximum candidates, so scanned rows
+    never accumulate beyond the scan batch size.
+    """
+
+    __slots__ = ("first", "last", "low", "high", "size")
+
+    def __init__(self):
+        self.first: tuple[float, float, int] | None = None
+        self.last: tuple[float, float, int] | None = None
+        self.low: tuple[float, float, int] | None = None
+        self.high: tuple[float, float, int] | None = None
+        self.size = 0
+
+    def add(self, point: tuple[float, float, int]) -> None:
+        if self.first is None:
+            self.first = point
+        self.last = point
+        self.size += 1
+        # Rows arrive in (ts, id) order, so strict comparisons make the
+        # first occurrence win value ties.
+        if self.low is None or point[1] < self.low[1]:
+            self.low = point
+        if self.high is None or point[1] > self.high[1]:
+            self.high = point
+
+    def extremes(self) -> list[tuple[float, float, int]]:
+        """Min+max; a constant (or single-sample) bucket contributes one."""
+        if self.low is self.high:
+            return [self.low]
+        return [self.low, self.high]
+
+    def largest_deviation_extreme(self) -> tuple[float, float, int]:
+        return _single_slot_choice((self.first, self.last), self.low, self.high)
+
+
+# Rows per fetchmany during the timeline's streaming bucket scan: bounds the
+# samples held on the Python side independently of the queried row count.
+_TIMELINE_SCAN_BATCH = 1000
+
+
+def _channel_range_clause(
+    start: float | None, end: float | None
+) -> tuple[str, list]:
+    """Inclusive range filter (events are a point set) for one channel.
+
+    The two channel placeholders are not included; callers bind them first.
+    """
+    clause = " WHERE device = ? AND metric = ? AND value IS NOT NULL"
+    params: list = []
+    if start is not None:
+        clause += " AND ts >= ?"
+        params.append(start)
+    if end is not None:
+        clause += " AND ts <= ?"
+        params.append(end)
+    return clause, params
+
+
+def _fetch_points_batched(sql: str, params: list) -> list[tuple[float, float, int]]:
+    """Run a (ts, value, id) SELECT and collect rows through bounded batches."""
+    return [
+        (r["ts"], r["value"], r["id"])
+        for batch in db.query_batches(sql, params, _TIMELINE_SCAN_BATCH)
+        for r in batch
+    ]
+
+
+def _downsample_channel_samples(
+    device: str, metric: str, start: float | None, end: float | None,
+    max_points: int,
+) -> tuple[list[tuple[float, float, int]], int]:
+    """Bounded-memory extreme-value sampling for one channel's queried range.
+
+    Returns ``(values, total)`` with ``total`` the range's sample count and
+    ``values`` the at-most-``max_points`` selected samples in (ts, event id)
+    order — identical output to ``downsample(<all range samples>,
+    max_points)``.
+
+    Must run inside a :func:`db.read_snapshot`.  The range count is read
+    first (so a concurrent commit cannot change the bucket layout mid-scan);
+    an in-budget series is streamed in bounded batches and returned as-is,
+    while an over-budget series keeps only its first/last endpoints and a
+    fixed-size accumulator per bucket and streams the strictly-interior rows
+    batch by batch.  Extra Python work memory is therefore bounded by the
+    scan batch size plus ``max_points``, never by the range's raw row count.
+    """
+    clause, range_params = _channel_range_clause(start, end)
+    bind = [device, metric, *range_params]
+    total = db.query_one(
+        f"SELECT COUNT(*) AS c FROM events{clause}", bind
+    )["c"]
+    if total == 0:
+        return [], 0
+
+    if total <= max_points:
+        points = _fetch_points_batched(
+            f"SELECT ts, value, id FROM events{clause} ORDER BY ts, id", bind
+        )
+        return points, total
+    if max_points <= 0:
+        return [], total
+    if max_points == 1:
+        row = db.query_one(
+            f"SELECT ts, value, id FROM events{clause} ORDER BY ts, id ASC LIMIT 1",
+            bind,
+        )
+        return [(row["ts"], row["value"], row["id"])], total
+
+    first_row = db.query_one(
+        f"SELECT ts, value, id FROM events{clause} ORDER BY ts, id ASC LIMIT 1",
+        bind,
+    )
+    last_row = db.query_one(
+        f"SELECT ts, value, id FROM events{clause} ORDER BY ts DESC, id DESC LIMIT 1",
+        bind,
+    )
+    first = (first_row["ts"], first_row["value"], first_row["id"])
+    last = (last_row["ts"], last_row["value"], last_row["id"])
+
+    # No point budget for interior samples: the count and the endpoints are
+    # all that is needed, so no interior rows have to be streamed at all.
+    if max_points == 2:
+        return [first, last], total
+
+    # Endpoints take two slots; the interior is split into time-ordered
+    # buckets exactly like downsample(); an odd budget leaves one slot for
+    # the final bucket.
+    middle_n = total - 2
+    budget = max_points - 2
+    bucket_count = (budget + 1) // 2
+    base, extra = divmod(middle_n, bucket_count)
+    sizes = [base + (1 if i < extra else 0) for i in range(bucket_count)]
+
+    # Interior rows lie strictly between the endpoints.  (device, metric, ts)
+    # is UNIQUE, so within this channel no two rows share a timestamp: the
+    # strict (ts, id) order interior is exactly ts in (first_ts, last_ts),
+    # which also keeps the predicate a plain index range.
+    middle_clause = clause + " AND ts > ? AND ts < ?"
+    middle_params = [*bind, first[0], last[0]]
+
+    buckets = [_BucketAccumulator() for _ in range(bucket_count)]
+    seen = 0
+    bucket_index = 0
+    cursor_in_bucket = 0
+    for batch in db.query_batches(
+        f"SELECT ts, value, id FROM events{middle_clause} ORDER BY ts, id ASC",
+        middle_params,
+        _TIMELINE_SCAN_BATCH,
+    ):
+        for r in batch:
+            while cursor_in_bucket >= sizes[bucket_index]:
+                bucket_index += 1
+                cursor_in_bucket = 0
+            buckets[bucket_index].add((r["ts"], r["value"], r["id"]))
+            cursor_in_bucket += 1
+            seen += 1
+    assert seen == middle_n, (seen, middle_n)
+
+    picked: list[tuple[float, float, int]] = [first]
+    for i, acc in enumerate(buckets):
+        if acc.size == 0:
+            continue
+        if budget % 2 == 1 and i == bucket_count - 1:
+            picked.append(acc.largest_deviation_extreme())
+        else:
+            picked.extend(acc.extremes())
+    picked.append(last)
+    picked.sort(key=lambda p: (p[0], p[2]))
+    return picked, total
 
 
 def downsample(values: list[tuple[float, float, int]], max_points: int) -> list[tuple[float, float, int]]:
@@ -1357,21 +1544,14 @@ def timeline_data(start: float | None, end: float | None, max_points: int = 400)
 
         channel_payload = []
         for ch in channels_in_range:
-            sql = (
-                "SELECT ts, value, id FROM events WHERE device = ? AND metric = ? AND value IS NOT NULL"
+            # The range is counted first and its rows then scanned batch by
+            # batch inside this same snapshot, so the bucket split and its
+            # selected extrema describe one committed instant and the per-
+            # channel work memory stays bounded by max_points (plus one scan
+            # batch), not by the raw row count of the queried range.
+            values, total = _downsample_channel_samples(
+                ch["device"], ch["metric"], start, end, max_points
             )
-            params: list = [ch["device"], ch["metric"]]
-            if start is not None:
-                sql += " AND ts >= ?"
-                params.append(start)
-            if end is not None:
-                sql += " AND ts <= ?"
-                params.append(end)
-            sql += " ORDER BY ts, id"
-            rows = db.query(sql, params)
-            values = [(r["ts"], r["value"], r["id"]) for r in rows]
-            total = len(values)
-            values = downsample(values, max_points)
             channel_payload.append(
                 {
                     "device": ch["device"],
