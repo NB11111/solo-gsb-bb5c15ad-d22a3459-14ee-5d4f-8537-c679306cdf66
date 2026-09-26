@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Iterable
+from typing import Any, Generator, Iterable
 
 DB_PATH = os.environ.get("SENSOR_DB_PATH", "/data/sensor.db")
 # When running locally without docker, fall back to ./data next to the repo.
@@ -287,6 +287,30 @@ def transaction():
 
 def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
     return _read_target().execute(sql, tuple(params)).fetchall()
+
+
+def query_batches(
+    sql: str, params: Iterable[Any] = (), batch_size: int = 2000
+) -> Generator[list[sqlite3.Row], None, None]:
+    """Yield SELECT rows in bounded batches instead of one fetchall.
+
+    At most ``batch_size`` rows are materialized at a time, so scans over
+    arbitrarily large result sets keep a constant memory footprint.  The
+    stream runs on the read connection: inside a ``read_snapshot()`` block
+    every batch reads the same pinned committed view (a concurrent commit
+    cannot change rows mid-stream); outside one, the open cursor holds its
+    own read transaction for the duration of the stream.  The cursor is
+    closed when the generator is exhausted or closed.
+    """
+    cur = _read_target().execute(sql, tuple(params))
+    try:
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            yield rows
+    finally:
+        cur.close()
 
 
 def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:

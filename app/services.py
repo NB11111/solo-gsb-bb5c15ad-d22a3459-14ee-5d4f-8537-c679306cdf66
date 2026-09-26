@@ -6,6 +6,7 @@ import json
 import math
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 
 from . import db
 from .audit import audit_cadence
@@ -1267,21 +1268,23 @@ def _bucket_extremes(
     return [low, high]
 
 
-def _largest_deviation_extreme(
-    bucket: list[tuple[float, float, int]],
+def _pick_deviation_extreme(
+    first: tuple[float, float, int],
+    last: tuple[float, float, int],
+    low: tuple[float, float, int],
+    high: tuple[float, float, int],
 ) -> tuple[float, float, int]:
-    """The single bucket extreme to keep when the budget allows only one.
+    """Single-slot choice between a bucket's min/max candidates.
 
-    Between the bucket's minimum and maximum candidates, the one deviating
-    more from the bucket's own first→last baseline (the straight line
-    between the bucket's first and last samples) is kept; equal deviations
-    resolve stably to the sample appearing first in (ts, event id) order.
+    The candidate deviating more from the bucket's own first→last baseline
+    (the straight line between the bucket's ``first`` and ``last`` samples)
+    wins; equal deviations resolve stably to the sample appearing first in
+    (ts, event id) order.  A constant (or single-sample) bucket — where the
+    minimum and maximum are the same sample — contributes it once.
     """
-    low = min(bucket, key=lambda p: p[1])
-    high = max(bucket, key=lambda p: p[1])
     if low is high:
         return low
-    (t0, v0, _), (t1, v1, _) = bucket[0], bucket[-1]
+    (t0, v0, _), (t1, v1, _) = first, last
 
     def deviation(p: tuple[float, float, int]) -> float:
         if t1 == t0:
@@ -1295,6 +1298,21 @@ def _largest_deviation_extreme(
     if dev_high > dev_low:
         return high
     return min((low, high), key=lambda p: (p[0], p[2]))
+
+
+def _largest_deviation_extreme(
+    bucket: list[tuple[float, float, int]],
+) -> tuple[float, float, int]:
+    """The single bucket extreme to keep when the budget allows only one.
+
+    Between the bucket's minimum and maximum candidates, the one deviating
+    more from the bucket's own first→last baseline (the straight line
+    between the bucket's first and last samples) is kept; equal deviations
+    resolve stably to the sample appearing first in (ts, event id) order.
+    """
+    low = min(bucket, key=lambda p: p[1])
+    high = max(bucket, key=lambda p: p[1])
+    return _pick_deviation_extreme(bucket[0], bucket[-1], low, high)
 
 
 def downsample(values: list[tuple[float, float, int]], max_points: int) -> list[tuple[float, float, int]]:
@@ -1341,6 +1359,116 @@ def downsample(values: list[tuple[float, float, int]], max_points: int) -> list[
     return picked
 
 
+def _downsample_stream(
+    total: int,
+    batches: Iterable[list[tuple[float, float, int]]],
+    max_points: int,
+) -> list[tuple[float, float, int]]:
+    """downsample() folded over a batched (ts, event id)-ordered row stream.
+
+    ``total`` is the exact number of samples the batches will yield (the
+    COUNT taken in the same read snapshot); each batch is a list of
+    (ts, value, event_id) tuples ordered by (ts, event id).  The selection
+    is exactly :func:`downsample`'s — first/last samples kept, the middle
+    split into the same time-ordered buckets, per-bucket min+max (first
+    occurrence wins ties), the odd-budget single slot with its first→last
+    baseline tie-break, original order in the output — but at any moment
+    only one batch, the current bucket's first/last/min/max candidates and
+    the (≤ max_points) picked samples are held, so the working memory stays
+    bounded by max_points plus one batch instead of growing with the raw
+    row count of the queried range.
+    """
+    if total <= max_points:
+        # Fits the budget: every sample is kept, exactly like downsample().
+        kept: list[tuple[float, float, int]] = []
+        for batch in batches:
+            kept.extend(batch)
+        return kept
+    if max_points <= 0:
+        return []
+    if max_points == 1:
+        for batch in batches:
+            if batch:
+                return [batch[0]]
+        return []
+    if max_points == 2:
+        # Only the range's first and last samples survive the budget.
+        first = last = None
+        for batch in batches:
+            for row in batch:
+                if first is None:
+                    first = row
+                last = row
+        return [first, last] if first is not None else []
+
+    budget = max_points - 2  # point slots left for middle samples
+    bucket_count = (budget + 1) // 2  # each bucket wants min+max
+    base, extra = divmod(total - 2, bucket_count)
+    single_slot_last = budget % 2 == 1
+
+    picked: list[tuple[float, float, int]] = []
+    # Current bucket's incremental state: its first and last samples (the
+    # single-slot baseline anchors) and its min/max candidates (replaced
+    # only on a strictly smaller/larger value, so the first occurrence
+    # wins ties exactly like min()/max() over the materialized bucket).
+    bucket_first = bucket_last = bucket_low = bucket_high = None
+    bucket_fill = 0
+    bucket_index = 0
+    bucket_size = base + (1 if extra > 0 else 0)
+
+    def feed_middle(row: tuple[float, float, int]) -> None:
+        nonlocal bucket_first, bucket_last, bucket_low, bucket_high
+        nonlocal bucket_fill, bucket_index, bucket_size
+        if bucket_fill == 0:
+            bucket_first = bucket_last = bucket_low = bucket_high = row
+            bucket_fill = 1
+        else:
+            bucket_last = row
+            bucket_fill += 1
+            if row[1] < bucket_low[1]:
+                bucket_low = row
+            if row[1] > bucket_high[1]:
+                bucket_high = row
+        if bucket_fill < bucket_size:
+            return
+        # Bucket complete: emit its selection, same rules as downsample().
+        if single_slot_last and bucket_index == bucket_count - 1:
+            picked.append(
+                _pick_deviation_extreme(bucket_first, bucket_last, bucket_low, bucket_high)
+            )
+        elif bucket_low is bucket_high:
+            picked.append(bucket_low)
+        else:
+            picked.extend((bucket_low, bucket_high))
+        bucket_index += 1
+        bucket_fill = 0
+        bucket_size = base + (1 if bucket_index < extra else 0)
+
+    first_row = None
+    pending = None  # held back one row so the range's last sample stays out of the buckets
+    for batch in batches:
+        for row in batch:
+            if first_row is None:
+                first_row = row
+                continue
+            if pending is not None:
+                feed_middle(pending)
+            pending = row
+    last_row = pending
+
+    result = [first_row, *picked, last_row]
+    result.sort(key=lambda p: (p[0], p[2]))
+    return result
+
+
+def _sample_tuple_batches(
+    batches: Iterable[list],
+) -> Iterable[list[tuple[float, float, int]]]:
+    """Project raw row batches to (ts, value, event_id) tuples, one batch at a time."""
+    for batch in batches:
+        yield [(r["ts"], r["value"], r["id"]) for r in batch]
+
+
 def timeline_data(start: float | None, end: float | None, max_points: int = 400) -> dict:
     # The whole timeline is one committed view: channels, their samples,
     # faults, annotations, maintenance and suppression must describe the
@@ -1357,21 +1485,37 @@ def timeline_data(start: float | None, end: float | None, max_points: int = 400)
 
         channel_payload = []
         for ch in channels_in_range:
-            sql = (
-                "SELECT ts, value, id FROM events WHERE device = ? AND metric = ? AND value IS NOT NULL"
-            )
+            clause = " WHERE device = ? AND metric = ? AND value IS NOT NULL"
             params: list = [ch["device"], ch["metric"]]
             if start is not None:
-                sql += " AND ts >= ?"
+                clause += " AND ts >= ?"
                 params.append(start)
             if end is not None:
-                sql += " AND ts <= ?"
+                clause += " AND ts <= ?"
                 params.append(end)
-            sql += " ORDER BY ts, id"
-            rows = db.query(sql, params)
-            values = [(r["ts"], r["value"], r["id"]) for r in rows]
-            total = len(values)
-            values = downsample(values, max_points)
+            # Count the range's samples first, inside this pinned snapshot,
+            # so the bucket layout is computed from the same committed view
+            # the scan then reads — a concurrent commit cannot desync them.
+            total = db.query_one(f"SELECT COUNT(*) AS c FROM events{clause}", params)["c"]
+            select_sql = f"SELECT ts, value, id FROM events{clause} ORDER BY ts, id"
+            if total <= max_points:
+                # Fits the point budget: every sample is returned, and the
+                # single fetch is itself bounded by max_points rows.
+                values = [
+                    (r["ts"], r["value"], r["id"]) for r in db.query(select_sql, params)
+                ]
+            else:
+                # Over budget: stream the ordered rows in bounded batches
+                # and fold them into the same bucketed extreme selection,
+                # so the sampling working set grows with max_points (plus
+                # one batch), not with the raw row count of the range.
+                batches = db.query_batches(select_sql, params)
+                try:
+                    values = _downsample_stream(
+                        total, _sample_tuple_batches(batches), max_points
+                    )
+                finally:
+                    batches.close()
             channel_payload.append(
                 {
                     "device": ch["device"],
